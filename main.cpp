@@ -1,261 +1,202 @@
-#include<vector>
 #include<iostream>
-#include<fstream>
-#include<mkl.h>
-#include<cmath>
-#include<cassert>
-#include<numbers>
-#include<stdexcept>
-#include<chrono>
-
-//built laplacian matrix in COO format 
-void build_laplacian_coo(
-    int m,
-    std::vector<MKL_INT>& rows,
-    std::vector<MKL_INT>& cols,
-    std::vector<double>& vals)
+#include<vector>
+#include<set>
+#include <algorithm>
+#include "mkl.h"
+#include "mkl_cblas.h"
+//function to create CSR 
+sparse_matrix_t create_mkl_csr(
+    int rows,
+    int cols,
+    const std::vector<MKL_INT>&r ,
+    const std::vector<MKL_INT>&c,
+    const std::vector<double>&v)
 {
-    const int W = m - 1;      
-    const int n = W * W;
-
-    rows.clear();
-    cols.clear();
-    vals.clear();
-    rows.reserve(n * 5);
-    cols.reserve(n * 5);
-    vals.reserve(n * 5);
-
-    for (int r = 0; r < W; ++r)
-    {
-        for (int c = 0; c < W; ++c)
-        {
-            const int k = r * W + c;
-
-            // center
-            rows.push_back(k);
-            cols.push_back(k);
-            vals.push_back(-4.0);
-
-            // left neighbor
-            if (c > 0) {
-                const int j = k - 1;
-                rows.push_back(k); cols.push_back(j); vals.push_back(1.0);
-            }
-
-            // right neighbor
-            if (c + 1 < W) {
-                const int j = k + 1;
-                rows.push_back(k); cols.push_back(j); vals.push_back(1.0);
-            }
-
-            // up neighbor
-            if (r > 0) {
-                const int j = k - W;
-                rows.push_back(k); cols.push_back(j); vals.push_back(1.0);
-            }
-
-            // down neighbor
-            if (r + 1 < W) {
-                const int j = k + W;
-                rows.push_back(k); cols.push_back(j); vals.push_back(1.0);
-            }
-        }
-    }
+    sparse_matrix_t coo,csr;
+    mkl_sparse_d_create_coo(&coo,SPARSE_INDEX_BASE_ZERO,rows,cols,r.size(),(MKL_INT*)r.data(),(MKL_INT*)c.data(),(double*)v.data());
+    mkl_sparse_convert_csr(coo,SPARSE_OPERATION_NON_TRANSPOSE,&csr);
+    mkl_sparse_destroy(coo);
+    return csr;
 }
 
 
-
-
-//build rhs 
-std::vector<double> build_rhs(int m,double G , double sigma)
+//function to solve using Schur method 
+void Schur(sparse_matrix_t K,int nx,sparse_matrix_t ALU,std::vector<double>&x)
 {
-    int n=(m-1)*(m-1);
+    //size of K
+    int n=nx*nx;
 
-    //L=[-1,1]
-    int L1=-1;
-    int L2=1;
+    //mid 
+    int mid=(nx+1)/2-1;
 
-    //step 
-    double h=(L2-L1)/static_cast<double>(m);
+    //boundaries=union(num(:,mid)',num(mid,:));
+    std::set<int> boundary_set;
 
-    // i need the right side 
-    std::vector<double> b(n);
-
-    //coordiantes
-    std::vector<double> xx(n) ,yy(n);
-    for(int i=0;i<m-1;i++)
+    for(int i=0;i<nx;i++)
     {
-        xx[i]=L1+h*(i+1);
-        yy[i]=L1+h*(i+1);
+        //add vertical mid line in boundaries_set
+        boundary_set.insert(i*nx+mid);
+
+        //add horizontal mid line in boundaries_set
+        boundary_set.insert(mid*nx+i);
     }
 
-    //make the f 
-    auto f=[&](double X,double Y)
+    std::vector<int> inner_idx,bound_idx;
+    std::vector<int>g2i(n,-1); //for inner
+    std::vector<int>g2b(n,-1); //for boundaries
+    //create sd1,sd2,sd3
+    for(int i=0;i<n;i++)
     {
-        return 4*std::numbers::pi*G*(1/std::sqrt(std::numbers::pi*sigma))*std::exp(-(X*X+Y*Y)/(2*sigma*sigma));
-    };
-
-    //create the f(x,y)
-    for(int r=0;r<m-1;r++)
-    {
-        for(int c=0;c<m-1;c++)
+        //check if it belongs to boundary 
+        if(boundary_set.count(i))
         {
-            int k=r*(m-1)+c;
-            b[k]=h*h*f(xx[c],yy[r]);
+            //if it belongs to boundary add it to boundary vector
+            g2b[i]=bound_idx.size();
+            bound_idx.push_back(i);
+        }
+        else{
+            //else it belongs to inner add it to inner vector
+            g2i[i]=inner_idx.size();
+            inner_idx.push_back(i);
+        }    
+    }
+
+    //construct A,B,BT,D
+    //A=K(inner,inner) , B=K(innder,boundaries), BT=K(boundaries,inner),D=K(boundaries,boundaries)
+
+    //create inner,boundaries sizes for matrices A,B,BT,D
+    int nI=inner_idx.size();    
+    int nB=bound_idx.size();
+
+    //csr form of A,B,BT,D
+    MKL_INT *r_start,*r_end,*cols;
+    double* vals;
+    sparse_index_base_t indexing;
+    MKL_INT rows_k,cols_k;
+    mkl_sparse_d_export_csr(K,&indexing,&rows_k,&cols_k,&r_start,&r_end,&cols,&vals);
+
+
+    //create vector to store rows of A,B,BT,D
+    std::vector<MKL_INT> rA,rB,rBT,rD;
+
+    
+    //create vector to store cols of A,B,BT,D
+    std::vector<MKL_INT> cA,cB,cBT,cD;
+
+    
+    //create vector to store values of A,B,BT,D
+    std::vector<double> vA,vB,vBT,vD;
+
+
+    //create the matrices B,BT,D
+    for(int i=0;i<n;i++)
+    {   
+        for(int j=r_start[i];j<r_end[i];j++)
+        { 
+            int row=i;
+            int col=cols[j];
+            double value=vals[j];
+            //matrix A had dimensions inner,inner
+            if(g2i[row]!=-1 && g2i[col]!=-1){rA.push_back(g2i[row]); cA.push_back(g2i[col]); vA.push_back(value);}
+            //matrix B has dimensions inner,boundaries
+            if(g2i[row]!=-1 && g2b[col]!=-1){rB.push_back(g2i[row]); cB.push_back(g2b[col]); vB.push_back(value);}
+            //matrix BT has dimensions boundaries innner
+            if(g2b[row]!=-1 && g2i[col]!=-1){rBT.push_back(g2b[row]); cBT.push_back(g2i[col]); vBT.push_back(value);}
+            //matrix D has dimensions bounadires,bounadries
+            if(g2b[row]!=-1 && g2b[col]!=-1){rD.push_back(g2b[row]); cD.push_back(g2b[col]); vD.push_back(value);}
         }
     }
-    return b;
-}
 
-//CG
-std::vector<double> cg_solve(
-    sparse_matrix_t A,
-    const std::vector<double>& b,
-    int n,
-    int maxIters,
-    double tol)
-{
-    std::cout << "Starting Conjugate Gradient...\n";
+    //construct the car forms of A,B,BT,D
+    sparse_matrix_t A=create_mkl_csr(nI,nI,rA,cA,vA);
+    sparse_matrix_t B=create_mkl_csr(nI,nB,rB,cB,vB);
+    sparse_matrix_t BT=create_mkl_csr(nB,nI,rBT,cBT,vBT);
+    sparse_matrix_t D=create_mkl_csr(nB,nB,rD,cD,vD);
 
-    std::vector<double> x(n, 0.0);      // initial guess
-    std::vector<double> r = b;          // r = b - A*x = b
-    std::vector<double> p = r;          // p = r
-    std::vector<double> Ap(n);
+    //construct fI,fB
+    std::vector<double>fI(nI);
+    std::vector<double>fB(nB);
 
-    matrix_descr descr;
-    descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+    //form vector b
+    std::vector<double>b(n,0.0);
+    std::vector<double>ones(n,1.0); //identity matrix 
+    
+    
+    //descripotr ofr K
+    matrix_descr descr_gen={SPARSE_MATRIX_TYPE_GENERAL,SPARSE_FILL_MODE_FULL,SPARSE_DIAG_NON_UNIT};
 
-    double normb = cblas_dnrm2(n, r.data(), 1);
-    if (normb == 0.0) normb = 1.0;
+    //b=K*ones
+    mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE,1.0,K,descr_gen,ones.data(),0.0,b.data());
 
-    for (int iter = 0; iter < maxIters; iter++)
+    //fI=b(inner)
+    for(int i=0;i<nI;i++)
     {
-        double r2 = cblas_ddot(n, r.data(), 1, r.data(), 1);
-
-        // Ap = A * p
-        mkl_sparse_d_mv(
-            SPARSE_OPERATION_NON_TRANSPOSE,
-            1.0,
-            A,
-            descr,
-            p.data(),
-            0.0,
-            Ap.data()
-        );
-
-        double pAp = cblas_ddot(n, p.data(), 1, Ap.data(), 1);
-        double alpha = r2 / pAp;
-
-        // x = x + alpha*p
-        cblas_daxpy(n, alpha, p.data(), 1, x.data(), 1);
-
-        // r = r - alpha*Ap
-        double neg_alpha = -alpha;
-        cblas_daxpy(n, neg_alpha, Ap.data(), 1, r.data(), 1);
-
-        double normr = cblas_dnrm2(n, r.data(), 1);
-        if (iter % 100 == 0)
-            std::cout << " iter " << iter << "  residual = " << normr << "\n";
-
-        if (normr < tol * normb)
-        {
-            std::cout << "CG converged in " << iter
-                      << " iterations, residual = " << normr << "\n";
-            return x;
-        }
-
-        double r_new = cblas_ddot(n, r.data(), 1, r.data(), 1);
-        double beta = r_new / r2;
-
-        // p = r + beta*p
-        cblas_daxpby(n, 1.0, r.data(), 1, beta, p.data(), 1);
+        fI[i]+=b[inner_idx[i]];
     }
 
-    std::cout << "CG did NOT converge within " << maxIters << " iterations\n";
-    return x;
-}
+    //fB=b(boundaries)
+    for(int i=0;i<nB;i++)
+    {
+        fB[i]+=b[bound_idx[i]];
+    }
 
-//main function 
+    //fs=fB-BT*(U\(L\fI));
+    matrix_descr L={SPARSE_MATRIX_TYPE_TRIANGULAR,SPARSE_FILL_MODE_LOWER,SPARSE_DIAG_NON_UNIT};
+    matrix_descr U={SPARSE_MATRIX_TYPE_TRIANGULAR, SPARSE_FILL_MODE_UPPER,SPARSE_DIAG_NON_UNIT};
+
+    std::vector<double> z(nI),tmp(nI),fs(nB);
+    //solve L*tmp=fI
+    mkl_sparse_d_trsv(SPARSE_OPERATION_NON_TRANSPOSE,1.0,ALU,L,fI.data(),tmp.data());
+    //solve U*z=tmp
+    mkl_sparse_d_trsv(SPARSE_OPERATION_NON_TRANSPOSE,1.0,ALU,U,tmp.data(),z.data());
+
+
+    //compute BT*z
+    std::vector<double> BTz(nB);
+    mkl_sparse_d_mv(SPARSE_OPERATION_NON_TRANSPOSE,1.0,BT,descr_gen,z.data(),0.0,BTz.data());
+    
+    //compute fs=fB-BTz
+    // for(int i=0;i<nB;i++)
+    // {
+    //     fs[i]=fB[i]=BTz[i];
+    // }
+
+    //fs=fB
+    cblas_dcopy(nB,fB.data(),1,fs.data(),1);
+
+    //fs-=BTz
+    cblas_daxpy(nB,-1.0,BTz.data(),1,fs.data(),1);
+
+
+    //compute S matrix 
+    std::vector<std::vector<double>> S_dense(nB*nB,0.0);
+
+    /*compute S=D-BT*(U\(L\B))
+    S=D-BT*z2
+    U*z2=temp2
+    L*temp2=B
+*/    
+    //create vectors z2,temp2,BTZ2,Bj οπου bJ διανυσμα με την j στηλη του Β
+    std::vector<double> z2(nI),temp2(nI),BTZ2(nB),Bj(nI,0.0);
+    //transfomr D matrix to dense
+    for(size_t k=0;k<vD.size(),k++)
+    {
+        MKL_INT row=rD[k];
+        MKL_INT col=cD[k];
+        double value=vD[k];
+
+        S_Dense[row+col*nB]=value;
+    }
+
+
+    //solve L*temp2=B
+    mkl_sparse_d_trsv(SPARSE_OPERATION_NON_TRANSPOSE,1.0,ALU,L,B.data(),temp2.data());
+
+
+}
 int main()
 {
-    auto start=std::chrono::high_resolution_clock::now();
-    std::cout<<"simulation starting\n";
-    //dimensions
-    int m=200;
-    int n=(m-1)*(m-1);
-
-    //variables for function f 
-    double G=1.0,sigma=0.1;
-
-    double L1=-1,L2=1;
-    double h=(L2-L1)/m;
-    
-    std::vector<double> xx(m-1),yy(m-1);
-    for(int i=0;i<m-1;i++)
-    {
-        xx[i]=L1+h*(i+1);
-        yy[i]=L1+h*(i+1);
-    }
-
-    //build the laplacian in coo
-    std::vector<MKL_INT>rows,cols;
-    std::vector<double>vals;
-    build_laplacian_coo(m,rows,cols,vals);
- 
-
-    //create MKL COO matrix 
-    sparse_matrix_t Acoo;
-    mkl_sparse_d_create_coo(&Acoo,SPARSE_INDEX_BASE_ZERO,n,n,vals.size(),rows.data(),cols.data(),vals.data());
-
-    //convert COO to CSR
-    sparse_matrix_t Ahandle ;
-    mkl_sparse_convert_csr(Acoo,SPARSE_OPERATION_NON_TRANSPOSE,&Ahandle);
-    mkl_sparse_destroy(Acoo);
-    
 
 
-    sparse_index_base_t indexing ;
-    MKL_INT rows_csr, cols_csr;
-    MKL_INT *row_ptr, *row_end_unused, *col_ind;
-    double *val_csr;
-
-
- mkl_sparse_d_export_csr(Ahandle, &indexing,
-        &rows_csr, &cols_csr,
-        &row_ptr, &row_end_unused,
-        &col_ind, &val_csr);
-
-
-    //build rhs 
-    std::vector<double>b=build_rhs(m,G,sigma);
-
-
-    //solve 
-   std::vector<double> x =cg_solve(Ahandle,b, n, 50000, 1e-5);
-
-    mkl_sparse_destroy(Ahandle);
-
-   std::ofstream out("solution.dat");
-   if(!out)
-   {
-    throw std::runtime_error("failed to open the file\n");
-   }
-
-   out.precision(10);
-   for(int r=0;r<m-1;r++)
-   {
-    for(int c=0;c<m-1;c++)
-    {
-        int k=r*(m-1)+c;
-        out<<xx[c]<<" "<<yy[r]<<" "<<x[k]<<"\n";
-    }
-   }
-   out.close();
-
-   std::cout<<"solutions written in solution.dat\n";
-    
-   auto end=std::chrono::high_resolution_clock::now();
-   std::chrono::duration<double>elapsed=end-start;
-   std::cout<<"time needed for the simulation: "<<elapsed.count()<<'\n';
-    return 0;   
+    return 0;
 }
